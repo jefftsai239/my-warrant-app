@@ -13,11 +13,16 @@ def load_data():
     STOCK_API = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL"
     headers = {'User-Agent': 'Mozilla/5.0'}
     
-    w_json = requests.get(WARRANT_API, headers=headers).json()
-    s_json = requests.get(STOCK_API, headers=headers).json()
+    # --- 修正處：加入 verify=False ---
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning) # 隱藏討厭的警告訊息
     
-    df_w = pd.DataFrame(w_json)
-    df_s = pd.DataFrame(s_json)
+    try:
+        w_resp = requests.get(WARRANT_API, headers=headers, verify=False)
+        s_resp = requests.get(STOCK_API, headers=headers, verify=False)
+        
+        w_json = w_resp.json()
+        s_json = s_resp.json()
     
     # 清洗數據
     df_s['ClosingPrice'] = pd.to_numeric(df_s['ClosingPrice'], errors='coerce')
