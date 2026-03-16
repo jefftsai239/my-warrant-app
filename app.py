@@ -8,110 +8,106 @@ import time
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 網頁基本設定
-st.set_page_config(page_title="權證評估工具", layout="wide", page_icon="📈")
+st.set_page_config(page_title="權證智能分析", layout="wide", page_icon="📈")
 
-@st.cache_data(ttl=600)  # 快取 10 分鐘，兼顧即時性與防封鎖
+@st.cache_data(ttl=600)
 def load_data():
-    # 備選 API 清單
-    WARRANT_URLS = [
-        "https://openapi.twse.com.tw/v1/warrant/listAll",
-        "https://openapi.twse.com.tw/v1/opendata/t187ap37_L"
-    ]
+    # 權證與股價 API 網址
+    WARRANT_API = "https://openapi.twse.com.tw/v1/warrant/listAll"
     STOCK_API = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_AVG_ALL"
     
+    # 強化 Headers：模擬最新版 Chrome 瀏覽器，減少被擋機率
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Referer': 'https://www.twse.com.tw/',
+        'Connection': 'keep-alive'
     }
 
-    # 1. 抓取股價資料
-    try:
-        s_resp = requests.get(STOCK_API, headers=headers, verify=False, timeout=15)
-        df_s = pd.DataFrame(s_resp.json())
-        df_s['ClosingPrice'] = pd.to_numeric(df_s['ClosingPrice'], errors='coerce')
-        df_s['Code'] = df_s['Code'].str.strip()
-        df_s['Name'] = df_s['Name'].str.strip()
-    except Exception as e:
-        st.error(f"股價資料抓取失敗: {e}")
-        return pd.DataFrame()
-
-    # 2. 抓取權證資料 (嘗試多個 API 直到成功)
-    df_w = pd.DataFrame()
-    for url in WARRANT_URLS:
-        try:
-            time.sleep(1) # 稍微延遲避免請求過快
-            w_resp = requests.get(url, headers=headers, verify=False, timeout=15)
-            if w_resp.status_code == 200 and len(w_resp.text) > 100:
-                df_w = pd.DataFrame(w_resp.json())
-                break
-        except:
-            continue
-            
-    if df_w.empty:
-        st.error("❌ 無法從證交所取得權證資料。原因：API 回傳為空或連線遭拒。")
-        st.info("💡 建議：請稍後 5 分鐘再重新整理網頁，或於台股收盤時間後測試。")
-        return pd.DataFrame()
-
-    # 3. 自動辨識欄位名稱 (適應不同 API 版本)
-    col_map = {
-        'strike': ['ExercisePrice', '最新履約價格(元)/履約指數', '原始履約價格(元)/履約指數'],
-        'target': ['UnderlyingIndex', '標的證券/指數', '標的代號'],
-        'code': ['WarrantCode', '權證代號'],
-        'name': ['WarrantName', '權證簡稱', '權證名稱']
-    }
-
-    def get_real_col(target_key):
-        for possible_name in col_map[target_key]:
-            if possible_name in df_w.columns:
-                return possible_name
+    def fetch_with_retry(url, name, retries=3):
+        for i in range(retries):
+            try:
+                time.sleep(1) # 每次重試前稍微延遲
+                resp = requests.get(url, headers=headers, verify=False, timeout=15)
+                if resp.status_code == 200 and len(resp.text.strip()) > 0:
+                    return resp.json()
+                else:
+                    st.warning(f"正在嘗試重新連接 {name} (第 {i+1} 次)...")
+            except Exception:
+                continue
         return None
 
-    w_strike = get_real_col('strike')
-    w_target = get_real_col('target')
-    w_code = get_real_col('code')
-    w_name = get_real_col('name')
+    # 1. 抓取股價
+    s_json = fetch_with_retry(STOCK_API, "股價資料")
+    if not s_json:
+        st.error("❌ 股價資料抓取失敗。這通常是證交所暫時阻擋了雲端連線。")
+        return pd.DataFrame()
+    
+    df_s = pd.DataFrame(s_json)
+    df_s['ClosingPrice'] = pd.to_numeric(df_s['ClosingPrice'], errors='coerce')
+    df_s['Code'] = df_s['Code'].str.strip()
+    df_s['Name'] = df_s['Name'].str.strip()
 
-    # 4. 資料清洗與轉換
+    # 2. 抓取權證
+    w_json = fetch_with_retry(WARRANT_API, "權證資料")
+    if not w_json:
+        # 如果 listAll 失敗，嘗試備用 API
+        W_BACKUP = "https://openapi.twse.com.tw/v1/opendata/t187ap37_L"
+        w_json = fetch_with_retry(W_BACKUP, "備用權證資料")
+        
+    if not w_json:
+        st.error("❌ 權證資料抓取失敗。")
+        return pd.DataFrame()
+
+    df_w = pd.DataFrame(w_json)
+
+    # 3. 自動辨識欄位
+    col_map = {
+        'strike': ['ExercisePrice', '最新履約價格(元)/履約指數'],
+        'target': ['UnderlyingIndex', '標的證券/指數'],
+        'code': ['WarrantCode', '權證代號'],
+        'name': ['WarrantName', '權證簡稱']
+    }
+
+    def get_col(k):
+        for c in col_map[k]:
+            if c in df_w.columns: return c
+        return None
+
+    w_strike, w_target, w_code, w_name = get_col('strike'), get_col('target'), get_col('code'), get_col('name')
+
+    # 4. 清洗與合併
     df_w['StrikePrice'] = pd.to_numeric(df_w[w_strike], errors='coerce')
     df_w['TargetClean'] = df_w[w_target].str.strip()
 
-    # 5. 合併資料 (先嘗試代碼對接，再嘗試名稱對接)
-    # 嘗試代碼匹配 (如: 2330 == 2330)
+    # 雙重匹配邏輯 (代號 vs 名稱)
     merged = pd.merge(df_w, df_s, left_on='TargetClean', right_on='Code', how='left')
-    
-    # 如果標現價全是空值，嘗試名稱匹配 (如: 台積電 == 台積電)
     if merged['ClosingPrice'].isna().sum() > len(merged) * 0.8:
         merged = pd.merge(df_w, df_s, left_on='TargetClean', right_on='Name', how='left')
 
-    # 保留必要欄位
-    merged = merged[[w_code, w_name, 'TargetClean', 'ClosingPrice', 'StrikePrice']].copy()
-    merged.columns = ['權證代號', '權證名稱', '標的', '標的現價', '履約價']
-    return merged
+    # 整理最終表格
+    final = merged[[w_code, w_name, 'TargetClean', 'ClosingPrice', 'StrikePrice']].copy()
+    final.columns = ['權證代號', '權證名稱', '標的', '標的現價', '履約價']
+    return final
 
-# --- UI 介面 ---
+# --- 介面呈現 ---
 st.title("🛡️ 權證智能分析儀表板")
 
 data = load_data()
 
 if not data.empty:
     st.sidebar.header("搜尋與自選")
-    all_stocks = sorted(data['標的'].dropna().unique())
+    search_input = st.sidebar.text_input("輸入標的名或代號 (如: 台積電 或 2330):", "台積電")
     
-    # 搜尋框與選單
-    search_input = st.sidebar.text_input("輸入標的名稱或代號 (如: 2330 或 台積電):", "台積電")
-    
-    # 過濾邏輯
-    filtered = data[(data['標的'] == search_input) | (data['標的'].str.contains(search_input, na=False))]
+    # 模糊搜尋
+    filtered = data[data['標的'].str.contains(search_input, na=False)]
 
     if not filtered.empty:
-        # 標的資訊顯示
-        target_name = filtered['標的'].iloc[0]
         curr_price = filtered['標的現價'].iloc[0]
-        
-        c1, c2 = st.columns(2)
-        c1.metric("標的名稱", target_name)
-        c2.metric("標的收盤價", f"{curr_price} 元")
+        st.subheader(f"🔍 {search_input} 相關權證分析")
+        st.metric("標的收盤價", f"{curr_price} 元")
 
-        # 計算評估建議
         def get_advice(row):
             if pd.isna(row['標的現價']) or pd.isna(row['履約價']): return "資料不全"
             m_ratio = (row['標的現價'] / row['履約價'] - 1) * 100
@@ -121,14 +117,8 @@ if not data.empty:
             return "🟡 觀察中"
 
         filtered['智能建議'] = filtered.apply(get_advice, axis=1)
-
-        # 顯示表格
-        st.subheader(f"🔍 '{target_name}' 相關權證分析")
-        st.dataframe(filtered[['權證代號', '權證名稱', '履約價', '智能建議']], 
-                     width='stretch', hide_index=True)
+        st.dataframe(filtered[['權證代號', '權證名稱', '履約價', '智能建議']], width='stretch', hide_index=True)
     else:
-        st.warning(f"找不到 '{search_input}' 的相關權證，請確認代號或名稱。")
+        st.warning("查無資料，請確認搜尋關鍵字。")
 else:
-    st.info("📡 等待資料傳輸中，請確保連線正常...")
-
-st.caption("註：建議於收盤後(14:30後)查看，資料較為齊全。")
+    st.info("📡 正在等待證交所回應，請重新整理網頁或稍後再試。")
